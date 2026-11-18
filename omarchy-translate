@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# omarchy-translate — translate selection/clipboard via translate-shell, show result in a notification
+# `omarchy-translate`       -> translate selection/clipboard; type if nothing is selected
+# `omarchy-translate-type`  -> type text to translate (symlink; or: omarchy-translate type)
+# `omarchy-translate-lang`  -> pick target language (symlink; or: omarchy-translate pick)
+set -uo pipefail
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-translate"
+TARGET_FILE="$CONF_DIR/target"
+DEFAULT_TARGET="en"
+TIMEOUT=12
+MAX_INPUT=4000
+SYNC="string:x-canonical-private-synchronous:omarchy-translate"
+ID_FILE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-translate.notify-id"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+RESULT_QML="$SCRIPT_DIR/Result.qml"
+RESULT_PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-translate-result.pid"
+THEME_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current/theme"
+
+TRANS_BIN="$HOME/.local/bin/trans"
+[[ -x "$TRANS_BIN" ]] || TRANS_BIN="$(command -v trans || true)"
+
+LANGS=(
+  "English (en)" "Punjabi (pa)" "Hindi (hi)" "Spanish (es)"
+  "French (fr)" "German (de)" "Japanese (ja)" "Vietnamese (vi)"
+)
+
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+oneline() { printf '%s' "$1" | tr '\n\t' '  ' | tr -s ' '; }
+esc()  { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+clip() { local s="$1" n="$2"; (( ${#s} > n )) && s="${s:0:n}…"; printf '%s' "$s"; }
+
+read_selection() {
+  local s
+  s="$(wl-paste -p -t text --no-newline 2>/dev/null || true)"
+  [[ -n "${s//[[:space:]]/}" ]] || s="$(wl-paste -t text --no-newline 2>/dev/null || true)"
+  printf '%s' "$s"
+}
+
+normalize_text() {
+  local s
+  s="$(trim "$1")"
+  [[ -n "$s" ]] || return 1
+  s="${s:0:MAX_INPUT}"
+  [[ "$s" == -* ]] && s=" $s"   # don't let trans parse text as an option
+  printf '%s' "$s"
+}
+
+# Omarchy's native input prompt (same UI as the language picker), Rofi fallback.
+input_text() {
+  local prompt="$1" out
+  if command -v omarchy-menu-input >/dev/null 2>&1; then
+    out="$(omarchy-menu-input "$prompt")" || return 1
+  elif command -v rofi >/dev/null 2>&1; then
+    out="$(printf '' | rofi -dmenu -p "$prompt")" || return 1
+  else
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+# Replace the previous notification when the server honors replaces_id (Quickshell, mako, dunst).
+notify() { # title body [urgency] [timeout_ms]
+  local id="" args=()
+  args=(-a Translate -i accessories-dictionary -u "${3:-normal}" -t "${4:-9000}" -h "$SYNC")
+  [[ -f "$ID_FILE" ]] && id="$(<"$ID_FILE")"
+  [[ "$id" =~ ^[0-9]+$ ]] && args+=(-r "$id")
+  local new_id
+  new_id="$(notify-send "${args[@]}" -p "$1" "$2" 2>/dev/null)" || true
+  [[ "$new_id" =~ ^[0-9]+$ ]] && printf '%s' "$new_id" >"$ID_FILE"
+}
+
+get_target() {
+  local t=""
+  [[ -f "$TARGET_FILE" ]] && t="$(<"$TARGET_FILE")"
+  [[ "$t" =~ ^[A-Za-z]{2,3}(-[A-Za-z]+)?$ ]] || t="$DEFAULT_TARGET"
+  printf '%s' "$t"
+}
+
+# "Punjabi" for a known code, "PA" otherwise.
+lang_name() {
+  local code="${1,,}" entry
+  for entry in "${LANGS[@]}"; do
+    [[ "${entry##* (}" == "${code})" ]] && { printf '%s' "${entry% (*}"; return 0; }
+  done
+  printf '%s' "${code^^}"
+}
+
+# Close the "Translating…" toast once the result window takes over. Quickshell
+# does not act on the freedesktop CloseNotification call, so use Omarchy's own
+# notification IPC first; keep the standard call as a fallback.
+dismiss_toast() {
+  local id
+  id="$(cat "$ID_FILE" 2>/dev/null || true)"
+  if command -v omarchy-shell >/dev/null 2>&1; then
+    omarchy-shell notifications dismiss "Translating →" >/dev/null 2>&1 || true
+    rm -f "$ID_FILE"
+    return 0
+  fi
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  if command -v gdbus >/dev/null 2>&1; then
+    gdbus call --session --dest org.freedesktop.Notifications \
+      --object-path /org/freedesktop/Notifications \
+      --method org.freedesktop.Notifications.CloseNotification "$id" >/dev/null 2>&1 || true
+  elif command -v busctl >/dev/null 2>&1; then
+    busctl --user call org.freedesktop.Notifications /org/freedesktop/Notifications \
+      org.freedesktop.Notifications CloseNotification u "$id" >/dev/null 2>&1 || true
+  fi
+  rm -f "$ID_FILE"
+}
+
+# Values from the active Omarchy theme, so the card matches the menu.
+theme_get() { # file section key fallback
+  local file="$THEME_DIR/$1" section="$2" key="$3" fallback="$4" val=""
+  if [[ -f "$file" ]]; then
+    val="$(awk -v section="$section" -v key="$key" '
+      /^[ \t]*\[/ { s=$0; gsub(/[ \t]/, "", s); next }
+      s == "[" section "]" && $0 ~ "^[ \t]*" key "[ \t]*=" {
+        sub(/^[^=]*=[ \t]*/, "")
+        gsub(/^"|"[ \t]*$/, "")
+        print
+        exit
+      }' "$file")"
+  fi
+  printf '%s' "${val:-$fallback}"
+}
+
+theme_color() { # key fallback (colours.toml, no sections)
+  local key="$1" fallback="$2" val=""
+  if [[ -f "$THEME_DIR/colors.toml" ]]; then
+    val="$(sed -n "s/^$key[[:space:]]*=[[:space:]]*\"\\(#[0-9A-Fa-f]*\\)\".*/\\1/p" "$THEME_DIR/colors.toml" | head -1)"
+  fi
+  printf '%s' "${val:-$fallback}"
+}
+
+# Remove a result window still on screen from a previous translation, so the
+# input prompt or language picker is never hidden behind it.
+close_result_window() {
+  local old
+  old="$(cat "$RESULT_PID_FILE" 2>/dev/null || true)"
+  if [[ "$old" =~ ^[0-9]+$ ]] && [[ -r "/proc/$old/cmdline" ]] \
+     && tr '\0' ' ' <"/proc/$old/cmdline" | grep -q 'Result.qml'; then
+    kill "$old" 2>/dev/null || true
+    rm -f "$RESULT_PID_FILE"
+  fi
+}
+
+# Show the translation in a temporary floating card (the Omarchy menu look),
+# never in the notification bar. The toast only says that it is translating.
+show_result() { # body [footer]
+  local body="$1" footer="${2:-Esc or click outside to close}"
+  dismiss_toast
+
+  if [[ ! -f "$RESULT_QML" ]] || ! command -v qs >/dev/null 2>&1; then
+    printf '%s\n' "$body"
+    notify "Translate → ${target^^} · copied" "Translation copied to the clipboard." low 5000
+    return 0
+  fi
+
+  local screen radius base_size
+  screen="$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused) | .name' 2>/dev/null | head -1 || true)"
+  radius="$(hyprctl getoption decoration:rounding 2>/dev/null | sed -n 's/^int:[[:space:]]*//p' | head -1 || true)"
+  [[ "$radius" =~ ^[0-9]+$ ]] || radius=8
+  base_size="$(theme_get shell.toml font base-size 13)"
+  [[ "$base_size" =~ ^[0-9]+$ ]] || base_size=13
+
+  close_result_window
+
+  setsid env TR_TEXT="$body" \
+    TR_TITLE="Translate → $(lang_name "$target")" \
+    TR_SOURCE="$(clip "$(oneline "$text")" 90)" \
+    TR_FOOTER="$footer" \
+    TR_SCREEN="$screen" \
+    TR_BG="$(theme_get shell.toml menu background '#0D0808')" \
+    TR_ALPHA="$(theme_get shell.toml menu background-alpha 0.97)" \
+    TR_FG="$(theme_get shell.toml menu text '#F5F5F5')" \
+    TR_ACCENT="$(theme_color accent '#F60101')" \
+    TR_MUTED="$(theme_color muted '#786E6E')" \
+    TR_RADIUS="$radius" \
+    TR_FONT_SIZE="$((base_size + 5))" \
+    qs -p "$RESULT_QML" >/dev/null 2>&1 &
+  printf '%s' "$!" >"$RESULT_PID_FILE"
+}
+
+# Prefer Walker, then Omarchy's native picker, then Rofi.
+pick_one() {
+  local prompt="$1"; shift
+  if command -v walker >/dev/null 2>&1; then
+    printf '%s\n' "$@" | walker --dmenu -p "$prompt"
+  elif command -v omarchy-menu-select >/dev/null 2>&1; then
+    omarchy-menu-select "$prompt" "$@"
+  elif command -v rofi >/dev/null 2>&1; then
+    printf '%s\n' "$@" | rofi -dmenu -p "$prompt"
+  else
+    return 1
+  fi
+}
+
+pick_lang() {
+  local cur choice code
+  cur="$(get_target)"
+  choice="$(pick_one "Translate to… (now: ${cur})" "${LANGS[@]}")" || return 1
+  code="$(sed -n 's/.*(\(.*\))$/\1/p' <<<"$choice")"
+  [[ -z "$code" && "$choice" =~ ^[A-Za-z]{2,3}(-[A-Za-z]+)?$ ]] && code="$choice"
+  [[ "$code" =~ ^[A-Za-z]{2,3}(-[A-Za-z]+)?$ ]] || return 1
+  mkdir -p "$CONF_DIR" || return 1
+  printf '%s' "$code" >"$TARGET_FILE" || return 1
+  notify "Translate" "Target language: <b>${code^^}</b>" low 3000
+  return 0
+}
+
+# A result card from the last translation must not sit over the input prompt.
+close_result_window
+
+# `omarchy-translate-type` / `omarchy-translate type` always opens the input prompt.
+if [[ "$(basename "$0")" == *-type || "${1:-}" == type ]]; then
+  MODE="type"
+else
+  MODE="selection"
+fi
+
+# `omarchy-translate-lang` / `omarchy-translate pick` only chooses a language.
+if [[ "$(basename "$0")" == *-lang || "${1:-}" == pick ]]; then
+  pick_lang || exit 0
+  exit 0
+fi
+
+[[ -n "$TRANS_BIN" ]] || { notify "Translate" "trans (translate-shell) not found" critical; exit 1; }
+
+# First use: choose a target instead of silently translating English to English.
+if [[ ! -f "$TARGET_FILE" ]]; then
+  pick_lang || exit 0
+fi
+target="$(get_target)"
+
+if [[ "$MODE" == "type" ]]; then
+  typed="$(input_text "Translate to ${target^^} — type text")" || exit 0
+  text="$(normalize_text "$typed")" || { notify "Translate" "No text entered" low 3000; exit 1; }
+else
+  selected="$(read_selection)"
+  # Nothing selected: open the same native input prompt instead of a dead end.
+  if [[ -z "${selected//[[:space:]]/}" ]]; then
+    selected="$(input_text "Translate to ${target^^} — type text")" || exit 0
+  fi
+  text="$(normalize_text "$selected")" || { notify "Translate" "No text selected or entered" low 3000; exit 1; }
+fi
+# Two engines may be tried, so the "Translating…" toast lives through both.
+notify "Translating → ${target^^}" "<i>$(clip "$(oneline "$text")" 80 | esc)</i>" low $(( (TIMEOUT * 2 + 2) * 1000 ))
+
+# trans exits 0 even when an engine returns HTTP 502 with an empty body, so
+# decide on the output, not the exit code. Bing has been reliable; Google is
+# the fallback. Keep the last engine error for a failure that says why.
+result=""
+last_error=""
+timed_out=0
+for engine in bing google; do
+  err_file="$(mktemp)"
+  result="$(timeout "$TIMEOUT" "$TRANS_BIN" -no-init -brief -no-ansi -engine "$engine" ":$target" "$text" 2>"$err_file")"
+  rc=$?
+  result="$(trim "$result")"
+  if [[ -n "$result" ]]; then
+    rm -f "$err_file"
+    last_error=""
+    break
+  fi
+  last_error="$(grep -aE '\[(ERROR|WARNING)\]' "$err_file" 2>/dev/null | tail -n 1 || true)"
+  [[ -n "$last_error" ]] || last_error="$(tail -n 1 "$err_file" 2>/dev/null || true)"
+  (( rc == 124 )) && timed_out=1
+  rm -f "$err_file"
+done
+
+if [[ -z "$result" ]]; then
+  if (( timed_out )); then
+    notify "Translate" "Timed out after ${TIMEOUT}s — check network" critical
+  elif [[ -n "$last_error" ]]; then
+    notify "Translate" "Translation failed"$'\n\n'"<i>$(clip "$(oneline "$last_error")" 160 | esc)</i>" critical
+  else
+    notify "Translate" "Translation failed — no result from bing or google" critical
+  fi
+  exit 1
+fi
+
+printf '%s' "$result" | wl-copy
+
+# Translating into the text's own language comes back unchanged: say so
+# instead of repeating it, and point at the picker.
+if [[ "$(printf '%s' "$result" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')" ]]; then
+  show_result "No change — already ${target^^}." \
+    "Press Super+Shift+D to choose another language · Esc or click outside to close"
+  exit 0
+fi
+
+# The full translation is already copied; the card shows all of it and scrolls
+# if it does not fit.
+show_result "$result" "Full translation copied · Esc or click outside to close"

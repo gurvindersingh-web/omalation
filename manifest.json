@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "gurvindersingh-web.omalation",
+  "name": "Omarchy Translator",
+  "version": "1.0.0",
+  "author": "Gurvinder Singh",
+  "license": "MIT",
+  "description": "Translate selected, clipboard, or typed text with a floating Omarchy-styled result card and copied output.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Translator",
+    "description": "Translate text: left click to type, middle click to translate selection/clipboard, right click to choose the target language.",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
