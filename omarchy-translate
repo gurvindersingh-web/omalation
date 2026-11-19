@@ -42,7 +42,6 @@ normalize_text() {
   s="$(trim "$1")"
   [[ -n "$s" ]] || return 1
   s="${s:0:MAX_INPUT}"
-  [[ "$s" == -* ]] && s=" $s"   # don't let trans parse text as an option
   printf '%s' "$s"
 }
 
@@ -255,7 +254,9 @@ last_error=""
 timed_out=0
 for engine in bing google; do
   err_file="$(mktemp)"
-  result="$(timeout "$TIMEOUT" "$TRANS_BIN" -no-init -brief -no-ansi -engine "$engine" ":$target" "$text" 2>"$err_file")"
+  # Feed the text on stdin: process arguments are visible to other local
+  # processes via /proc, so never pass user text as a command-line argument.
+  result="$(printf '%s' "$text" | timeout "$TIMEOUT" "$TRANS_BIN" -no-init -brief -no-ansi -engine "$engine" ":$target" 2>"$err_file")"
   rc=$?
   result="$(trim "$result")"
   if [[ -n "$result" ]]; then
